@@ -17,7 +17,7 @@ python reward_plotter.py --agent_ids 26 27 28 --window_size=10
 '''
 
 
-def plot_rewards(agents, window_size=100, colors=None, alpha=0.2, lr=None, n_timesteps=float('inf')):
+def plot_rewards(agents, window_size=100, colors=None, alpha=0.2, lr=None, n_timesteps=float('inf'), output_path=None):
     data = []
 
     for i in agents:
@@ -68,6 +68,11 @@ def plot_rewards(agents, window_size=100, colors=None, alpha=0.2, lr=None, n_tim
     plt.ylabel('Mean_Reward-{}'.format(window_size))
     plt.legend(lr)
     plt.grid()
+
+    if output_path is not None:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print('Saved plot to {}'.format(output_path))
+
     plt.show()
 
 
@@ -79,5 +84,6 @@ if __name__ == '__main__':
     parser.add_argument('--lr', nargs='+', type=str, default=None)
     parser.add_argument('--alpha', type=float, default=0.15)
     parser.add_argument('--n_steps', type=float, default=1e7)
+    parser.add_argument('--output_path', type=str, default='monitor_plot.png')
     args = parser.parse_args()
-    plot_rewards(args.agent_ids, args.window_size, args.colors, args.alpha, args.lr, args.n_steps)
+    plot_rewards(args.agent_ids, args.window_size, args.colors, args.alpha, args.lr, args.n_steps, args.output_path)

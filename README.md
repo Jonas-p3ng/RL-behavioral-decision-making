@@ -65,6 +65,23 @@ Initilize the best recorded agent and associated config file given the agent_id.
 
 - ```python3 monitor_plot.py --agent_ids 1 2 --window_size 100 --colors red blue --lr DDPG TRPO --alpha 0.1 --n_steps 1e5```
 
+# Pygame Visualization UI
+
+The project includes a lightweight Pygame UI to generate and display plots for rewards, trajectories, and method comparisons.
+
+1. Run training or testing to generate logs under ```logs/agent_x```.
+2. Launch the UI:
+
+- ```python tools/pygame_dashboard.py --agent_ids 1 2 3 --window_size 100```
+
+Controls:
+- ```1``` reward curves
+- ```2``` lane change + obstacle trajectory plot (uses latest file in ```logs/agent_x/trajectories```)
+- ```3``` comparison plot across methods
+- ```S``` export plots, logs, and models to ```outputs/exports```
+
+Trajectory CSVs are automatically saved per episode in ```logs/agent_x/trajectories``` during environment execution.
+
 # Important Directories
 - RL Policy Networks : agents/reinforcement_learning/stable_baselines/common/policies.py
 - Env and RL Config File: tools/cfgs/config.yaml

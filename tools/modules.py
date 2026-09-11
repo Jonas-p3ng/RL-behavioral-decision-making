@@ -1543,8 +1543,17 @@ class CameraManager(object):
         self.sensor = None
         self.transform_index = 0
         self._camera_transforms = [
-            carla.Transform(carla.Location(x=-5.5, z=2.8), carla.Rotation(pitch=-15)),
+            carla.Transform(carla.Location(x=-6.5, z=3.2), carla.Rotation(pitch=-12)),
             carla.Transform(carla.Location(x=1.6, z=1.7))]
+        attachment = getattr(carla, 'AttachmentType', None)
+        if attachment is None:
+            self._attachment_type = None
+        elif hasattr(attachment, 'SpringArmGhost'):
+            self._attachment_type = attachment.SpringArmGhost
+        elif hasattr(attachment, 'SpringArm'):
+            self._attachment_type = attachment.SpringArm
+        else:
+            self._attachment_type = attachment.Rigid
         self.sensors = [['sensor.camera.rgb', cc.Raw, 'Camera RGB']]  # see automatic_control.py for more sensor examples
         world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
@@ -1566,10 +1575,17 @@ class CameraManager(object):
             if self.sensor is not None:
                 self.sensor.destroy()
                 self.surface = None
-            self.sensor = self._parent.get_world().spawn_actor(
-                self.sensors[index][-1],
-                self._camera_transforms[self.transform_index],
-                attach_to=self._parent)
+            if self._attachment_type is None:
+                self.sensor = self._parent.get_world().spawn_actor(
+                    self.sensors[index][-1],
+                    self._camera_transforms[self.transform_index],
+                    attach_to=self._parent)
+            else:
+                self.sensor = self._parent.get_world().spawn_actor(
+                    self.sensors[index][-1],
+                    self._camera_transforms[self.transform_index],
+                    attach_to=self._parent,
+                    attachment_type=self._attachment_type)
             # We need to pass the lambda a weak reference to self to avoid
             # circular reference.
             weak_self = weakref.ref(self)

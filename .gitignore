@@ -1,0 +1,32 @@
+# 1. 忽略 Python 虚拟环境
+venv/
+env/
+.env/
+.venv/
+
+# 2. 忽略 Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 3. 忽略强化学习的训练日志和模型权重
+logs/
+runs/
+stable_baselines.egg-info/
+*.pth
+*.pt
+*.h5
+*.pkl
+
+# 4. 忽略 VS Code 本身的配置目录（可选）
+.vscode/
+
+# 5. 忽略 Jupyter Notebook 的检查点文件
+.ipynb_checkpoints/
+
+# 6. 忽略Pycharm配置文件
+.idea/
+
+# 7. 忽略训练输出目录
+outputs/
+supplimentaries/

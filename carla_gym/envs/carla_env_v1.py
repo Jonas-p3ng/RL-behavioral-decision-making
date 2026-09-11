@@ -3,7 +3,9 @@
 UCSC - ASL
 """
 
+import csv
 import gym
+import os
 import time
 import itertools
 from tools.modules import *
@@ -85,6 +87,7 @@ class CarlaGymEnv(gym.Env):
         self.look_back = int(cfg.GYM_ENV.LOOK_BACK)
         self.time_step = int(cfg.GYM_ENV.TIME_STEP)
         self.loop_break = int(cfg.GYM_ENV.LOOP_BREAK)
+        self.plan_tf = float(cfg.GYM_ENV.get('PLAN_TF', 5.0))
         self.effective_distance_from_vehicle_ahead = int(cfg.GYM_ENV.DISTN_FRM_VHCL_AHD)
         self.lanechange = False
         self.is_first_path = True
@@ -147,8 +150,189 @@ class CarlaGymEnv(gym.Env):
         else:
             self.dt = 0.05
 
+        # trajectory logging
+        self.trajectory_dir = None
+        self.plan_dir = None
+        self.surrounding_dir = None
+        self.latest_plan_path = None
+        self.latest_surrounding_path = None
+        self.trajectory_records = []
+        self.surrounding_records = []
+        self.trajectory_episode = 0
+        self.trajectory_step = 0
+        self.trajectory_start_time = None
+        self.surrounding_write_interval = int(cfg.GYM_ENV.get('SURROUNDING_WRITE_INTERVAL', 10))
+        self.last_plan_candidates = None
+        self.last_selected_path = None
+
     def seed(self, seed=None):
         pass
+
+    def _init_trajectory_logger(self, args):
+        base_dir = args.log_path
+        if base_dir is None:
+            base_dir = 'logs/agent_{}'.format(args.agent_id) if args.agent_id is not None else 'logs'
+        self.trajectory_dir = os.path.join(base_dir, 'trajectories')
+        self.plan_dir = os.path.join(self.trajectory_dir, 'plans')
+        self.surrounding_dir = os.path.join(self.trajectory_dir, 'surrounding')
+        os.makedirs(self.trajectory_dir, exist_ok=True)
+        os.makedirs(self.plan_dir, exist_ok=True)
+        os.makedirs(self.surrounding_dir, exist_ok=True)
+        self.latest_plan_path = os.path.join(self.plan_dir, 'latest_plans.csv')
+        self.latest_surrounding_path = os.path.join(self.surrounding_dir, 'latest_surrounding_tracks.csv')
+
+    def _reset_trajectory_episode(self):
+        self.trajectory_episode += 1
+        self.trajectory_step = 0
+        self.trajectory_records = []
+        self.surrounding_records = []
+        self.trajectory_start_time = time.time()
+
+    def _record_trajectory(self, ego_s, ego_d, last_speed, lead_actor, lane_change):
+        if self.trajectory_dir is None:
+            return
+
+        ego_loc = self.ego.get_location()
+        lead_x = float('nan')
+        lead_y = float('nan')
+        lead_dist = float('nan')
+        if lead_actor is not None:
+            lead_loc = lead_actor.get_location()
+            lead_x = lead_loc.x
+            lead_y = lead_loc.y
+            lead_dist = math.hypot(lead_x - ego_loc.x, lead_y - ego_loc.y)
+
+        self.trajectory_records.append({
+            'episode': self.trajectory_episode,
+            'step': self.trajectory_step,
+            't': time.time() - self.trajectory_start_time if self.trajectory_start_time else 0.0,
+            'ego_x': ego_loc.x,
+            'ego_y': ego_loc.y,
+            'ego_s': ego_s,
+            'ego_d': ego_d,
+            'ego_speed': last_speed,
+            'lane_change': int(bool(lane_change)),
+            'lead_x': lead_x,
+            'lead_y': lead_y,
+            'lead_dist': lead_dist
+        })
+        self._record_surrounding_trajectories(ego_loc, ego_s, ego_d, last_speed)
+        self.trajectory_step += 1
+
+    def _save_trajectory(self, reason):
+        if not self.trajectory_records or self.trajectory_dir is None:
+            return
+
+        filename = 'trajectory_ep{}_{}.csv'.format(self.trajectory_episode, reason)
+        file_path = os.path.join(self.trajectory_dir, filename)
+        fieldnames = list(self.trajectory_records[0].keys())
+        with open(file_path, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.trajectory_records)
+
+        self._write_surrounding_snapshot(reason)
+
+        if self.last_plan_candidates is not None and self.last_selected_path is not None:
+            self._write_plan_snapshot(self.last_plan_candidates, self.last_selected_path, reason)
+
+    def _record_surrounding_trajectories(self, ego_loc, ego_s, ego_d, ego_speed):
+        if self.surrounding_dir is None:
+            return
+
+        t_value = time.time() - self.trajectory_start_time if self.trajectory_start_time else 0.0
+        self.surrounding_records.append({
+            'episode': self.trajectory_episode,
+            'step': self.trajectory_step,
+            't': t_value,
+            'role': 'ego',
+            'actor_id': self.ego.id if self.ego is not None else -1,
+            'actor_index': -1,
+            'x': ego_loc.x,
+            'y': ego_loc.y,
+            's': ego_s,
+            'd': ego_d,
+            'speed': ego_speed
+        })
+
+        if self.traffic_module is not None:
+            for idx, actor_dic in enumerate(self.traffic_module.actors_batch):
+                actor = actor_dic.get('Actor')
+                if actor is None:
+                    continue
+                try:
+                    loc = actor.get_location()
+                    actor_s = actor_dic['Frenet State'][0][-1]
+                    actor_d = actor_dic['Frenet State'][1]
+                    actor_speed = get_speed(actor)
+                    actor_id = actor.id
+                except RuntimeError:
+                    continue
+                self.surrounding_records.append({
+                    'episode': self.trajectory_episode,
+                    'step': self.trajectory_step,
+                    't': t_value,
+                    'role': 'traffic',
+                    'actor_id': actor_id,
+                    'actor_index': idx,
+                    'x': loc.x,
+                    'y': loc.y,
+                    's': actor_s,
+                    'd': actor_d,
+                    'speed': actor_speed
+                })
+
+        if self.trajectory_step % max(1, self.surrounding_write_interval) == 0:
+            self._write_surrounding_snapshot()
+
+    def _write_surrounding_snapshot(self, reason=None):
+        if not self.surrounding_records or self.surrounding_dir is None:
+            return
+
+        if reason is None:
+            file_path = self.latest_surrounding_path
+        else:
+            file_path = os.path.join(
+                self.surrounding_dir,
+                'surrounding_ep{}_{}.csv'.format(self.trajectory_episode, reason)
+            )
+
+        fieldnames = list(self.surrounding_records[0].keys())
+        with open(file_path, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.surrounding_records)
+
+    def _write_plan_snapshot(self, fplist, selected_path, reason=None):
+        if self.plan_dir is None:
+            return
+
+        if reason is None:
+            file_path = self.latest_plan_path
+        else:
+            file_path = os.path.join(self.plan_dir, 'plans_ep{}_{}.csv'.format(self.trajectory_episode, reason))
+
+        fieldnames = ['path_type', 'traj_id', 'point_idx', 'x', 'y']
+        with open(file_path, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for fp in fplist:
+                for idx, (x, y) in enumerate(zip(fp.x, fp.y)):
+                    writer.writerow({
+                        'path_type': 'candidate',
+                        'traj_id': fp.id,
+                        'point_idx': idx,
+                        'x': x,
+                        'y': y
+                    })
+            for idx, (x, y) in enumerate(zip(selected_path.x, selected_path.y)):
+                writer.writerow({
+                    'path_type': 'selected',
+                    'traj_id': -1,
+                    'point_idx': idx,
+                    'x': x,
+                    'y': y
+                })
 
     def get_vehicle_ahead(self, ego_s, ego_d, ego_init_d, ego_target_d):
         """
@@ -453,10 +637,18 @@ class CarlaGymEnv(gym.Env):
         acc = math.sqrt(acc_vec.x ** 2 + acc_vec.y ** 2 + acc_vec.z ** 2)
         psi = math.radians(self.ego.get_transform().rotation.yaw)
         ego_state = [self.ego.get_location().x, self.ego.get_location().y, speed, acc, psi, temp, self.max_s]
-        fpath, self.lanechange, off_the_road = self.motionPlanner.run_step_single_path(ego_state, self.f_idx, df_n=action, Tf=5,
+        fpath, self.lanechange, off_the_road = self.motionPlanner.run_step_single_path(ego_state, self.f_idx, df_n=action, Tf=self.plan_tf,
                                                                          Vf_n=-1)
         wps_to_go = len(fpath.t) - 3  # -2 bc len gives # of items not the idx of last item + 2wp controller is used
         self.f_idx = 1
+        self.last_selected_path = fpath
+
+        change_lane = -1 if action < -0.33 else (1 if action > 0.33 else 0)
+        f_state = self.motionPlanner.estimate_frenet_state(ego_state, self.f_idx)
+        fplist = self.motionPlanner.calc_frenet_paths(f_state, change_lane=change_lane, target_speed=self.targetSpeed)
+        fplist = self.motionPlanner.calc_global_paths(fplist)
+        self.last_plan_candidates = fplist
+        self._write_plan_snapshot(fplist, fpath)
 
         """
                 **********************************************************************************************************************
@@ -471,8 +663,12 @@ class CarlaGymEnv(gym.Env):
         # follows path until end of WPs for max 1.5 * path_time or loop counter breaks unless there is a langechange
         loop_counter = 0
 
-        while self.f_idx < wps_to_go and (elapsed_time(path_start_time) < self.motionPlanner.D_T * 1.5 or
-                                          loop_counter < self.loop_break or self.lanechange):
+        while self.f_idx < wps_to_go:
+            within_time_budget = elapsed_time(path_start_time) < self.motionPlanner.D_T * 1.5
+            within_loop_budget = loop_counter < self.loop_break
+            continue_lanechange = self.lanechange
+            if not (within_time_budget or within_loop_budget or continue_lanechange):
+                break
 
             loop_counter += 1
             ego_state = [self.ego.get_location().x, self.ego.get_location().y,
@@ -524,6 +720,7 @@ class CarlaGymEnv(gym.Env):
             self.actor_enumerated_dict['EGO']['NORM_D'].append(round((ego_d + self.LANE_WIDTH) / (3 * self.LANE_WIDTH), 2))
             last_speed = get_speed(self.ego)
             self.actor_enumerated_dict['EGO']['SPEED'].append(last_speed / self.maxSpeed)
+            self._record_trajectory(ego_s, ego_d, last_speed, vehicle_ahead, self.lanechange)
             # if ego off-the road or collided
             if any(collision_hist):
                 collision = True
@@ -534,6 +731,10 @@ class CarlaGymEnv(gym.Env):
                 distance_traveled = self.max_s + distance_traveled
             if distance_traveled >= self.track_length:
                 track_finished = True
+
+        if self.verbosity:
+            print('STEP_TIME'.ljust(15), '{:+8.6f}'.format(elapsed_time(path_start_time)))
+            print('STEP_LOOPS'.ljust(15), loop_counter)
 
         """
                 *********************************************************************************************************************
@@ -591,6 +792,7 @@ class CarlaGymEnv(gym.Env):
             self.eps_rew += reward
             # print('eps rew: ', self.n_step, self.eps_rew)
             if self.verbosity: print('REWARD'.ljust(15), '{:+8.6f}'.format(reward))
+            self._save_trajectory('collision')
             return self.state, reward, done, {'reserved': 0}
 
         elif track_finished:
@@ -602,6 +804,7 @@ class CarlaGymEnv(gym.Env):
             self.eps_rew += reward
             # print('eps rew: ', self.n_step, self.eps_rew)
             if self.verbosity: print('REWARD'.ljust(15), '{:+8.6f}'.format(reward))
+            self._save_trajectory('finished')
             return self.state, reward, done, {'reserved': 0}
 
         elif off_the_road:
@@ -619,12 +822,13 @@ class CarlaGymEnv(gym.Env):
         return self.state, reward, done, {'reserved': 0}
 
     def reset(self):
+        self._reset_trajectory_episode()
         self.vehicleController.reset()
         self.world_module.reset()
         self.init_s = self.world_module.init_s
         init_d = self.world_module.init_d
         self.traffic_module.reset(self.init_s, init_d)
-        self.motionPlanner.reset(self.init_s, self.world_module.init_d, df_n=0, Tf=4, Vf_n=0, optimal_path=False)
+        self.motionPlanner.reset(self.init_s, self.world_module.init_d, df_n=0, Tf=self.plan_tf, Vf_n=0, optimal_path=False)
         self.f_idx = 0
 
         self.n_step = 0  # initialize episode steps count
@@ -659,6 +863,7 @@ class CarlaGymEnv(gym.Env):
 
     def begin_modules(self, args):
         self.verbosity = args.verbosity
+        self._init_trajectory_logger(args)
 
         # define and register module instances
         self.module_manager = ModuleManager()

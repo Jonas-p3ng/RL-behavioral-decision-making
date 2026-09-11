@@ -22,6 +22,9 @@ from stable_baselines import DDPG
 from stable_baselines import PPO2
 from stable_baselines import TRPO
 from stable_baselines import A2C
+from stable_baselines import SAC
+from stable_baselines.sac.policies import MlpPolicy as SACMlpPolicy
+from stable_baselines.sac.policies import CnnPolicy as SACCnnPolicy
 from stable_baselines.common.policies import BasePolicy, nature_cnn, register_policy, sequence_1d_cnn, sequence_1d_cnn_ego_bypass_tc
 
 
@@ -29,13 +32,27 @@ from stable_baselines.common.policies import BasePolicy, nature_cnn, register_po
 from config import cfg, log_config_to_file, cfg_from_list, cfg_from_yaml_file
 
 
+def apply_traffic_density(env, n_spawn_cars):
+    """Synchronize traffic density across cfg, env and traffic module."""
+    n_spawn_cars = int(n_spawn_cars)
+    cfg.TRAFFIC_MANAGER.N_SPAWN_CARS = n_spawn_cars
+
+    base_env = env.unwrapped if hasattr(env, 'unwrapped') else env
+    if hasattr(base_env, 'N_SPAWN_CARS'):
+        base_env.N_SPAWN_CARS = n_spawn_cars
+    if hasattr(base_env, 'traffic_module') and base_env.traffic_module is not None:
+        base_env.traffic_module.N_SPAWN_CARS = n_spawn_cars
+
+    print('Traffic density updated: N_SPAWN_CARS={}'.format(n_spawn_cars))
+
+
 def parse_args_cfgs():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config for training')
     parser.add_argument('--env', help='environment ID', type=str, default='CarlaGymEnv-v1')
     parser.add_argument('--log_interval', help='Log interval (model)', type=int, default=100)
-    parser.add_argument('--agent_id', type=int, default=None),
-    parser.add_argument('--num_timesteps', type=float, default=1e7),
+    parser.add_argument('--agent_id', type=int, default=None)
+    parser.add_argument('--num_timesteps', type=float, default=1e7)
     parser.add_argument('--save_path', help='Path to save trained model to', default=None, type=str)
     parser.add_argument('--log_path', help='Directory to save learning curve data.', default=None, type=str)
     parser.add_argument('--play_mode', type=int, help='Display mode: 0:off, 1:2D, 2:3D ', default=0)
@@ -47,6 +64,11 @@ def parse_args_cfgs():
     parser.add_argument('-p', '--carla_port', metavar='P', default=2000, type=int, help='TCP port to listen to (default: 2000)')
     parser.add_argument('--tm_port', default=8000, type=int, help='Traffic Manager TCP port to listen to (default: 8000)')
     parser.add_argument('--carla_res', metavar='WIDTHxHEIGHT', default='1280x720', help='window resolution (default: 1280x720)')
+    parser.add_argument('--use_curriculum', dest='use_curriculum', action='store_true',
+                        help='Enable staged curriculum training and override config CURRICULUM.ENABLED')
+    parser.add_argument('--no_curriculum', dest='use_curriculum', action='store_false',
+                        help='Disable staged curriculum training and override config CURRICULUM.ENABLED')
+    parser.set_defaults(use_curriculum=None)
 
 
     args = parser.parse_args()
@@ -83,6 +105,8 @@ if __name__ == '__main__':
     # --------------------------------------------------------------------------------------------------------------------
     if cfg.POLICY.NAME == 'DDPG':
         policy = {'MLP': DDPGMlpPolicy, 'CNN': DDPGCnnPolicy}   # DDPG does not have LSTM policy
+    elif cfg.POLICY.NAME == 'SAC':
+        policy = {'MLP': SACMlpPolicy, 'CNN': SACCnnPolicy}     # SAC does not have LSTM policy
     else:
         policy = {'MLP': CommonMlpPolicy, 'LSTM': CommonMlpLstmPolicy, 'CNN': CommonCnnPolicy}
 
@@ -127,6 +151,26 @@ if __name__ == '__main__':
             model = TRPO(policy[cfg.POLICY.NET], env, verbose=1, model_dir=save_path, policy_kwargs={'cnn_extractor': eval(cfg.POLICY.CNN_EXTRACTOR)})
         elif cfg.POLICY.NAME =='A2C':
             model = A2C(policy[cfg.POLICY.NET], env, verbose=1, model_dir=save_path, policy_kwargs={'cnn_extractor': eval(cfg.POLICY.CNN_EXTRACTOR)})
+        elif cfg.POLICY.NAME == 'SAC':
+            sac_cfg = cfg.get('SAC', {})
+            model = SAC(
+                policy[cfg.POLICY.NET],
+                env,
+                verbose=1,
+                gamma=float(sac_cfg.get('GAMMA', 0.99)),
+                learning_rate=float(sac_cfg.get('LEARNING_RATE', 3e-4)),
+                buffer_size=int(sac_cfg.get('BUFFER_SIZE', 50000)),
+                learning_starts=int(sac_cfg.get('LEARNING_STARTS', 100)),
+                train_freq=int(sac_cfg.get('TRAIN_FREQ', 1)),
+                batch_size=int(sac_cfg.get('BATCH_SIZE', 64)),
+                tau=float(sac_cfg.get('TAU', 0.005)),
+                ent_coef=sac_cfg.get('ENT_COEF', 'auto'),
+                target_update_interval=int(sac_cfg.get('TARGET_UPDATE_INTERVAL', 1)),
+                gradient_steps=int(sac_cfg.get('GRADIENT_STEPS', 1)),
+                target_entropy=sac_cfg.get('TARGET_ENTROPY', 'auto'),
+                random_exploration=float(sac_cfg.get('RANDOM_EXPLORATION', 0.0)),
+                policy_kwargs={'cnn_extractor': eval(cfg.POLICY.CNN_EXTRACTOR)}
+            )
         else:
             print(cfg.POLICY.NAME)
             raise Exception('Algorithm name is not defined!')
@@ -134,10 +178,42 @@ if __name__ == '__main__':
         print('Model is Created')
         try:
             print('Training Started')
-            if cfg.POLICY.NAME == 'DDPG':
-                model.learn(total_timesteps=args.num_timesteps, log_interval=args.log_interval, save_path=save_path)
+
+            def train_for_steps(total_timesteps, reset_num_timesteps):
+                if cfg.POLICY.NAME == 'DDPG':
+                    model.learn(total_timesteps=total_timesteps, log_interval=args.log_interval,
+                                save_path=save_path, reset_num_timesteps=reset_num_timesteps)
+                else:
+                    model.learn(total_timesteps=total_timesteps, log_interval=args.log_interval,
+                                reset_num_timesteps=reset_num_timesteps)
+
+            curriculum_cfg = cfg.get('CURRICULUM', {})
+            use_curriculum = curriculum_cfg.get('ENABLED', False) if args.use_curriculum is None else args.use_curriculum
+            if use_curriculum:
+                stages = curriculum_cfg.get('STAGES', [])
+                stage_ratios = [float(stage.get('RATIO', 0.0)) for stage in stages]
+                total_ratio = sum(stage_ratios)
+
+                if len(stages) == 0 or total_ratio <= 0:
+                    print('Curriculum is enabled but invalid, fallback to single-stage training.')
+                    train_for_steps(args.num_timesteps, True)
+                else:
+                    allocated_steps = 0
+                    for i, stage in enumerate(stages):
+                        if i < len(stages) - 1:
+                            stage_steps = int(args.num_timesteps * stage_ratios[i] / total_ratio)
+                            allocated_steps += stage_steps
+                        else:
+                            stage_steps = args.num_timesteps - allocated_steps
+
+                        stage_density = int(stage.get('N_SPAWN_CARS', cfg.TRAFFIC_MANAGER.N_SPAWN_CARS))
+                        apply_traffic_density(env, stage_density)
+                        print('Curriculum stage {}/{}: steps={}, N_SPAWN_CARS={}'.format(
+                            i + 1, len(stages), stage_steps, stage_density
+                        ))
+                        train_for_steps(stage_steps, reset_num_timesteps=(i == 0))
             else:
-                model.learn(total_timesteps=args.num_timesteps, log_interval=args.log_interval)
+                train_for_steps(args.num_timesteps, True)
         finally:
             print(100 * '*')
             print('FINISHED TRAINING; saving model...')
@@ -178,6 +254,8 @@ if __name__ == '__main__':
             model = TRPO.load(model_dir)
         elif cfg.POLICY.NAME == 'A2C':
             model = A2C.load(model_dir)
+        elif cfg.POLICY.NAME == 'SAC':
+            model = SAC.load(model_dir)
         else:
             print(cfg.POLICY.NAME)
             raise Exception('Algorithm name is not defined!')
